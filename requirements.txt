@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+scikit-learn
+pandas
+pydantic
+joblib
+pytest
+ruff # Linter
+requests

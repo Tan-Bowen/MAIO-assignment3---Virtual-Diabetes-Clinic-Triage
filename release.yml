@@ -1,0 +1,124 @@
+# .github/workflows/release.yml
+name: Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*' # Trigger on tags like v0.1, v0.2
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  MODEL_VERSION: ${{ github.ref_name }} # e.g., v0.1 or v0.2
+
+jobs:
+  build_publish_release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # To create GitHub Release
+      packages: write # To push to GHCR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- 1. Train Model and Get Metrics ---
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Train model for release (Sets MODEL_VERSION env for train.py)
+        env:
+          MODEL_VERSION: ${{ env.MODEL_VERSION }}
+        run: python app/train.py
+
+      - name: Read metrics and changelog
+        id: read_artifacts
+        run: |
+          METRICS=$(cat metrics.json)
+          CHANGELOG_ENTRY=$(grep -A 10 "## ${{ env.MODEL_VERSION }}" CHANGELOG.md | tail -n +2 | sed '/^$/d' | sed 's/\"/\\"/g' | tr '\n' ' ')
+          echo "metrics_json=$METRICS" >> $GITHUB_OUTPUT
+          echo "changelog_entry=$CHANGELOG_ENTRY" >> $GITHUB_OUTPUT
+
+      # --- 2. Build and Publish Docker Image ---
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MODEL_VERSION }}
+          # Pass the tag as a build argument to bake the version into the image
+          build-args: MODEL_VERSION=${{ env.MODEL_VERSION }}
+
+      # --- 3. Container Smoke Test (Acceptance Check) ---
+      - name: Run container smoke tests
+        run: |
+          IMAGE_TAG=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MODEL_VERSION }}
+          
+          # Run the container in detached mode
+          docker run -d -p 8000:8000 --name ml-service $IMAGE_TAG
+          
+          # Wait briefly for the service to start
+          sleep 10 
+          
+          # Test /health endpoint
+          HEALTH_STATUS=$(curl -s http://localhost:8000/health)
+          echo "Health Check: $HEALTH_STATUS"
+          if [[ $(echo "$HEALTH_STATUS" | jq -r '.status') != "ok" ]]; then
+            echo "Health check failed!"
+            exit 1
+          fi
+          
+          # Test /predict endpoint (Acceptance Test)
+          PREDICT_OUTPUT=$(curl -s -X POST http://localhost:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{"age": 0.02, "sex": -0.044, "bmi": 0.06, "bp": -0.03, "s1": -0.02, "s2": 0.03, "s3": -0.02, "s4": 0.02, "s5": 0.02, "s6": -0.001}')
+            
+          echo "Prediction Test: $PREDICT_OUTPUT"
+          # Check if the output contains a prediction key
+          if ! echo "$PREDICT_OUTPUT" | jq -e '.prediction' > /dev/null; then
+            echo "Prediction check failed!"
+            exit 1
+          fi
+
+          docker stop ml-service && docker rm ml-service
+
+      # --- 4. Create GitHub Release ---
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.MODEL_VERSION }}
+          name: Model Service ${{ env.MODEL_VERSION }}
+          body: |
+            ## Release Notes
+            ${{ steps.read_artifacts.outputs.changelog_entry }}
+            
+            ## Metrics
+            ```json
+            ${{ steps.read_artifacts.outputs.metrics_json }}
+            ```
+            
+            ## Pull and Run
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MODEL_VERSION }}
+            docker run -p 8000:8000 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.MODEL_VERSION }}
+            ```
+          files: |
+            model.joblib
+            metrics.json
+            CHANGELOG.md
